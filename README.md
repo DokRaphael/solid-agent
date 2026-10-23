@@ -4,6 +4,11 @@ A command-line Python agent that connects an LLM to Solidcraft's CAD tools throu
 
 I built this project **from scratch** to understand how an agent works and interacts with an MCP server. The agent loop is implemented directly in Python, covering tool discovery, model requests, tool execution, and feeding results back into the conversation.
 
+## Demo
+https://github.com/user-attachments/assets/5ee426fb-93e3-4507-aab7-c3a92fdd82e9
+
+
+
 ## How it works
 
 Given a natural-language request, the model selects which tools to call. The agent executes those calls through MCP and returns the results to the model, which can continue taking actions or provide an answer. Conversation history is kept throughout the session, with an iteration limit for each request.
