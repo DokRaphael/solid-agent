@@ -20,6 +20,7 @@ cp config.example.py config.py
 Edit `config.py` to set your API URL, model, Solidcraft connection address, and allowed directory, then run:
 
 ```bash
+Solidcraft --control 7878 &
 python solid-agent.py
 ```
 
