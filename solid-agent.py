@@ -55,135 +55,180 @@ async def main() :
                     "role":"user",
                     "content":user_request
                 })   
-                iteration = 0
-                agent_status = "running"
-                while iteration < config.MAX_ITERATIONS :
-                    try:
-                        print(f"[DEBUG] Messages : {len(messages)}")
-                        print(f"[DEBUG] Payload : {len(json.dumps(payload))} caractères")
-                        start = time.perf_counter()
-                        response = requests.post(
-                            config.LLM_URL,
-                            json=payload,
-                            timeout=config.LLM_TIMEOUT
-                        )
-                        response.raise_for_status()
-                    except requests.exceptions.ConnectionError:
-                            print ("Impossible de contacter Qwen")
-                            agent_status = "failed"
-                            break
-                    except requests.exceptions.HTTPError :
-                        print ("not OK")
-                        agent_status = "failed"
-                        break
-                    except requests.exceptions.Timeout:
-                        print ("timeout")
-                        print(f"[DEBUG] Timeout après {time.perf_counter() - start:.1f} s")
-                        agent_status = "failed"
-                        break
-                    else:
-                        print(f"[DEBUG] Réponse reçue en {time.perf_counter() - start:.1f} s")
-                        iteration+=1
-                        data = response.json()
-                        print("[DEBUG] finish_reason:", data["choices"][0]["finish_reason"])
-                        print("[DEBUG] usage:", data.get("usage"))                 
-                        assistant_message = data["choices"][0]["message"]
-                        toolcalls = assistant_message.get("tool_calls")
-                        if toolcalls is None:
-                            print(data["choices"][0]["message"]["content"])
-                            agent_status = "completed"
-                            messages.append(assistant_message)
-                            break
-                        else:
-                            print("Qwen more outils")
-                        messages.append(assistant_message)
+                await run_agent(
+                    session,
+                    messages,
+                    payload,
+                    allowed_tools,
+                    tool_history
+                )
 
-                        for tool_call in toolcalls :
-                            py_arguments = None
-                            raw_observation = None 
-                            tool_name = tool_call["function"]["name"]
-                            arguments = tool_call["function"]["arguments"]
-                            print(f"[Qwen] {tool_name} → {arguments}")
-                            try :
-                                py_arguments = json.loads(arguments)
-                            except (json.JSONDecodeError,TypeError) :
-                                result = {
-                                    "status":"error",
-                                    "message":"argument issue: "+arguments
-                                }
-                            else :
-                                if tool_name in allowed_tools:
-                                    try:
-                                        result = await session.call_tool(
-                                            name=tool_name,
-                                            arguments=py_arguments
-                                        )
-                                    except TypeError as exc:
-                                        result = {
-                                            "status":"error",
-                                            "message":"argument issue: "+str(exc)
-                                        }
-                                else :
-                                    result = {
-                                        "status": "error",
-                                        "message": "Outil inconnu : "+tool_name
-                                    }
-                            raw_size = 0
-                            if isinstance(result, dict):
-                                observation = json.dumps(result)
-                                raw_size = len(observation)
-                            else:
-                                text_parts = [
-                                    item.text
-                                    for item in result.content
-                                    if item.type == "text"
-                                ]
+def call_llm(payload):
+    response = requests.post(
+        config.LLM_URL,
+        json=payload,
+        timeout=config.LLM_TIMEOUT
+    )
+    response.raise_for_status()
+    return response.json()
 
-                                if text_parts:
-                                    observation = "\n".join(text_parts)
-                                    raw_size = len(observation)
-                                    raw_observation = observation
-                                    if tool_name == "list_commands":
-                                        commands = json.loads(observation)
-                                        observation = json.dumps([
-                                            {
-                                                "id": command["id"],
-                                                "enabled": command["enabled"]
-                                            }
-                                            for command in commands
-                                        ])
-                                else:
-                                    observation = json.dumps({
-                                        "status": "error" if result.is_error else "success",
-                                        "message": "Résultat MCP non textuel ; contenu non transmis à Qwen",
-                                        "content_types": [item.type for item in result.content]
-                                    })
-                                    raw_size = len(observation)
-                                
-                            if isinstance(result, dict):
-                                success = result.get("status") != "error"
-                                
-                            else:
-                                success = not result.is_error
+def prepare_observation(result, tool_name):
+    if isinstance(result, dict):
+        observation = json.dumps(result)
+    else:
+        text_parts = [
+            item.text
+            for item in result.content
+            if item.type == "text"
+        ]
 
-                            print(f"[MCP] {tool_name} → {'succès' if success else 'erreur'}")
-                            if not success:
-                                print(f"[MCP ERROR] {observation[:1000]}")
-                            tool_message = {
-                                "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "content": observation
-                            }
-                            tool_history.append({
-                                "tool": tool_name,
-                                "arguments": py_arguments,
-                                "result": raw_observation
-                            })
-                            messages.append(tool_message)
-                            print(f"[CONTEXT] Brut : {raw_size} → Envoyé : {len(observation)} caractères")
-                            print(f"[DEBUG] Observation : {len(observation)} caractères")
-                if agent_status == "running":
-                    agent_status = "max_iterations"
-                print("Agent status:", agent_status)
+        if text_parts:
+            observation = "\n".join(text_parts)
+        else:
+            observation = json.dumps({
+                "status": "error" if result.is_error else "success",
+                "message": "Résultat MCP non textuel",
+                "content_types": [item.type for item in result.content]
+            })
+    raw_observation = observation
 
+    success = (
+        result.get("status") != "error"
+        if isinstance(result, dict)
+        else not result.is_error
+    )
+    if tool_name == "describe_command" and success:
+        command = json.loads(observation)
+
+        observation = json.dumps({
+            "id": command["id"],
+            "input": command["input"],
+            "params": command["params"]
+        })
+    if tool_name == "list_commands" and success:
+        commands = json.loads(observation)
+
+        observation = json.dumps([
+            {
+                "id": command["id"],
+                "enabled": command["enabled"]
+            }
+            for command in commands
+        ])
+    return raw_observation, observation
+
+async def execute_tool(session, tool_name, arguments, allowed_tools):
+    try :
+        py_arguments = json.loads(arguments)
+    except (json.JSONDecodeError,TypeError) :
+        result = {
+            "status":"error",
+            "message":"argument issue: "+arguments
+        }
+    else :
+        if tool_name in allowed_tools:
+            try:
+                result = await session.call_tool(
+                    name=tool_name,
+                    arguments=py_arguments
+                )
+            except TypeError as exc:
+                result = {
+                    "status":"error",
+                    "message":"argument issue: "+str(exc)
+                }
+        else :
+            result = {
+                "status": "error",
+                "message": "Outil inconnu : "+tool_name
+            }
+    return result
+
+async def run_agent(session, messages, payload, allowed_tools, tool_history):
+    iteration = 0
+    agent_status = "running"
+    while iteration < config.MAX_ITERATIONS :
+        try:
+            print(f"[DEBUG] Messages : {len(messages)}")
+            print(f"[DEBUG] Payload : {len(json.dumps(payload))} caractères")
+            start = time.perf_counter()
+            tool_chars = sum(
+                len(message["content"])
+                for message in messages
+                if message["role"] == "tool"
+            )
+
+            print(f"[CONTEXT] Historique outils : {tool_chars} caractères")
+            data = call_llm(payload)
+        except requests.exceptions.ConnectionError:
+                print ("Impossible de contacter Qwen")
+                agent_status = "failed"
+                break
+        except requests.exceptions.HTTPError :
+            print ("not OK")
+            agent_status = "failed"
+            break
+        except requests.exceptions.Timeout:
+            print ("timeout")
+            print(f"[DEBUG] Timeout après {time.perf_counter() - start:.1f} s")
+            agent_status = "failed"
+            break
+        else:
+            print(f"[DEBUG] Réponse reçue en {time.perf_counter() - start:.1f} s")
+            iteration+=1
+            
+            print("[DEBUG] finish_reason:", data["choices"][0]["finish_reason"])
+            print("[DEBUG] usage:", data.get("usage"))                 
+            assistant_message = data["choices"][0]["message"]
+            toolcalls = assistant_message.get("tool_calls")
+            if toolcalls is None:
+                print(data["choices"][0]["message"]["content"])
+                agent_status = "completed"
+                messages.append(assistant_message)
+                break
+            else:
+                print("Qwen more outils")
+            messages.append(assistant_message)
+
+            for tool_call in toolcalls :
+                
+                tool_name = tool_call["function"]["name"]
+                arguments = tool_call["function"]["arguments"]
+                print(f"[Qwen] {tool_name} → {arguments}")
+                result = await execute_tool(
+                    session,
+                    tool_name,
+                    arguments,
+                    allowed_tools
+                )
+                raw_observation, observation = prepare_observation(result, tool_name)
+                raw_size = len(raw_observation)
+
+                if isinstance(result, dict):
+                    success = result.get("status") != "error"
+                    
+                else:
+                    success = not result.is_error
+
+                print(f"[MCP] {tool_name} → {'succès' if success else 'erreur'}")
+                if not success:
+                    print(f"[MCP ERROR] {observation[:1000]}")
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": observation
+                }
+                tool_history.append({
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "result": raw_observation
+                })
+                messages.append(tool_message)
+                print(f"[CONTEXT] Brut : {raw_size} → Envoyé : {len(observation)} caractères")
+                print(f"[DEBUG] Observation : {len(observation)} caractères")
+    if agent_status == "running":
+        agent_status = "max_iterations"
+    print("Agent status:", agent_status)
 asyncio.run(main())
+
+
