@@ -60,10 +60,13 @@ async def main() :
             }
             print(f"[DEBUG] Outils MCP : {len(tool_definition)}")
             print(f"[DEBUG] Taille des schémas : {len(json.dumps(tool_definition))} caractères")
+            request_id = 0
             while True:
                 user_request = input("What are we making ?")
+                
                 if user_request.strip().lower() == "exit":
                     break
+                request_id += 1
                 messages.append({
                     "role":"user",
                     "content":user_request
@@ -75,7 +78,8 @@ async def main() :
                     messages,
                     payload,
                     allowed_tools,
-                    tool_history
+                    tool_history,
+                    request_id
                 )
                 if agent_status == "completed":
                     context_size = len(json.dumps(messages))
@@ -164,10 +168,91 @@ async def execute_tool(session, tool_name, arguments, allowed_tools):
             }
     return result
 
-async def run_agent(session, messages, payload, allowed_tools, tool_history):
+async def run_agent(session, messages, payload, allowed_tools, tool_history, request_id):
     iteration = 0
     agent_status = "running"
     while iteration < config.MAX_ITERATIONS :
+        last_user_index = max(
+            index
+            for index, message in enumerate(messages)
+            if message["role"] == "user"
+        )
+
+        tool_cycles = [
+            index
+            for index in range(last_user_index + 1, len(messages))
+            if messages[index]["role"] == "assistant"
+            and messages[index].get("tool_calls")
+        ]
+        if len(tool_cycles) > 3:
+            start_recent = tool_cycles[-3]
+            print("[CONTEXT] Début des cycles récents :", start_recent)
+        cycle_ids = sorted({
+            entry["cycle_id"]
+            for entry in tool_history
+            if entry["request_id"] == request_id
+        })
+
+        recent_cycle_ids = set(cycle_ids[-3:])
+
+        old_history = [
+            entry
+            for entry in tool_history
+            if entry["request_id"] == request_id
+            and entry["cycle_id"] not in recent_cycle_ids
+        ]
+
+        operations = summarize_tool_history(old_history)
+        user_messages = [
+            message
+            for message in messages
+            if message["role"] == "user"
+        ]
+
+        current_goal = user_messages[-1] if user_messages else None
+        if len(tool_cycles) > 3 and current_goal:
+            cad_state = await get_cad_state(session)
+            compact_state = compact_cad_state(cad_state)
+
+            checkpoint_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        config.SYSTEM_PROMPT
+                        + "\n\nÉtat CAD actuel :\n"
+                        + json.dumps(compact_state, ensure_ascii=False)
+                        + "\n\nOpérations précédentes réussies :\n"
+                        + json.dumps(operations, ensure_ascii=False)
+                    )
+                },
+                current_goal,
+                *messages[start_recent:]
+            ]
+
+            print(
+                "[CHECKPOINT]",
+                len(messages),
+                "→",
+                len(checkpoint_messages),
+                "messages"
+            )
+            original_size = len(json.dumps(messages))
+            checkpoint_size = len(json.dumps(checkpoint_messages))
+
+            print(
+                f"[CHECKPOINT] Taille : {original_size} → {checkpoint_size} caractères"
+            )
+            if (
+                len(json.dumps(payload)) > config.CONTEXT_COMPACTION_THRESHOLD
+                and checkpoint_size <= original_size * 0.70
+            ):
+                messages[:] = checkpoint_messages
+
+                print(
+                    f"[CHECKPOINT] ACTIVÉ : "
+                    f"{original_size} → {checkpoint_size} caractères"
+                )
+        print("[CONTEXT] Cycles d'outils :", tool_cycles)
         try:
             print(f"[DEBUG] Messages : {len(messages)}")
             print(f"[DEBUG] Payload : {len(json.dumps(payload))} caractères")
@@ -219,7 +304,7 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history):
             else:
                 print("Qwen more outils")
             messages.append(assistant_message)
-
+            cycle_id = iteration
             for tool_call in toolcalls :
                 
                 tool_name = tool_call["function"]["name"]
@@ -249,15 +334,24 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history):
                     "content": observation
                 }
                 tool_history.append({
+                    "cycle_id": cycle_id,
                     "tool": tool_name,
                     "arguments": arguments,
-                    "result": raw_observation
+                    "result": raw_observation,
+                    "request_id": request_id,
                 })
                 messages.append(tool_message)
                 print(f"[CONTEXT] Brut : {raw_size} → Envoyé : {len(observation)} caractères")
                 print(f"[DEBUG] Observation : {len(observation)} caractères")
     if agent_status == "running":
         agent_status = "max_iterations"
+
+    print("[HISTORY] Cycles :", [
+        (entry["request_id"], entry["cycle_id"], entry["tool"])
+        for entry in tool_history
+    ])
+    operations = summarize_tool_history(tool_history)
+    print("[HISTORY] Opérations :", operations)
     print("Agent status:", agent_status)
     return agent_status
 
@@ -338,6 +432,36 @@ async def compact_history(session, messages):
     print(f"[COMPACTION] Taille : {original_size} → {compact_size} caractères")
     if compact_size < original_size:
         messages[:] = compact_messages
+
+def summarize_tool_history(tool_history):
+    operations = []
+
+    for entry in tool_history:
+        if entry["tool"] in ("execute", "batch", "set_parameter"):
+            arguments = json.loads(entry["arguments"])
+            try:
+                result = json.loads(entry["result"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(result, dict):
+                continue
+            if result.get("status") == "error":
+                continue
+
+            if result.get("ok") is False:
+                continue
+            if entry["tool"] == "execute":
+                operations.append(arguments["command"])
+
+            elif entry["tool"] == "batch":
+                for command in arguments["commands"]:
+                    operations.append(command["command"])
+
+            elif entry["tool"] == "set_parameter":
+                operations.append("set_parameter")
+
+    return operations
+
 asyncio.run(main())
 
 
