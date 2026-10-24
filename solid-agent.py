@@ -1,10 +1,12 @@
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.shared.exceptions import MCPError
 import asyncio
 import json 
 import requests
 import config
 import time
+
 server_params = StdioServerParameters(
     command=config.MCP_COMMAND,
     args=[
@@ -34,10 +36,17 @@ async def main() :
             print("[CAD STATE] Corps :", len(cad_state.get("bodies", [])))
             print("[CAD STATE] Paramètres :", len(cad_state.get("params", [])))
             result = await session.list_tools()
-            allowed_tools = {tool.name for tool in result.tools}
+
+            available_tools = [
+                tool
+                for tool in result.tools
+                if tool.name not in config.BLOCKED_TOOLS
+            ]
+
+            allowed_tools = {tool.name for tool in available_tools}
             tool_definition = []
             
-            for tool in result.tools :
+            for tool in available_tools :
                 tool_definition.append({
                     "type": "function",
                     "function": {
@@ -144,23 +153,66 @@ def prepare_observation(result, tool_name):
 async def execute_tool(session, tool_name, arguments, allowed_tools):
     try :
         py_arguments = json.loads(arguments)
+        if not isinstance(py_arguments, dict):
+            return {
+                "status": "error",
+                "message": "Les arguments doivent être un objet JSON"
+            }
     except (json.JSONDecodeError,TypeError) :
         result = {
             "status":"error",
             "message":"argument issue: "+arguments
         }
     else :
+        if tool_name == "execute":
+            command = py_arguments.get("command")
+
+            if command in config.BLOCKED_COMMANDS:
+                return {
+                    "status": "error",
+                    "message": f"Commande interdite : {command}"
+                }
+        if tool_name == "batch":
+            commands = py_arguments.get("commands")
+
+            if not isinstance(commands, list):
+                return {
+                    "status": "error",
+                    "message": "batch.commands doit être une liste"
+                }
+
+            for item in commands:
+                if not isinstance(item, dict):
+                    return {
+                        "status": "error",
+                        "message": "Commande batch invalide"
+                    }
+
+                command = item.get("command")
+
+                if not isinstance(command, str):
+                    return {
+                        "status": "error",
+                        "message": "Identifiant de commande invalide"
+                    }
+
+                if command in config.BLOCKED_COMMANDS:
+                    return {
+                        "status": "error",
+                        "message": f"Commande interdite : {command}"
+                    }
         if tool_name in allowed_tools:
             try:
                 result = await session.call_tool(
                     name=tool_name,
                     arguments=py_arguments
                 )
-            except TypeError as exc:
+            except (TypeError, MCPError) as exc:
                 result = {
                     "status":"error",
-                    "message":"argument issue: "+str(exc)
+                    "message":str(exc)
                 }
+            
         else :
             result = {
                 "status": "error",

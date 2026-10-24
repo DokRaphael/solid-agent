@@ -14,3 +14,13 @@ MCP_ALLOWED_PATH = "/path/to/your/cad-project"
 
 # Compaction
 CONTEXT_COMPACTION_THRESHOLD = 50000
+
+#RESTRICT
+BLOCKED_TOOLS = {
+    "new_design",
+}
+BLOCKED_COMMANDS = {
+    "file.new",
+    "file.open",
+    "file.close"
+}
