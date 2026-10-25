@@ -1,4 +1,14 @@
 /cours/
+/tests/
 /config.py
 __pycache__/
 .DS_Store
+
+# Local CAD projects, exports and backups
+*.solidcraft
+*.obj
+*.step
+*.stp
+*.stl
+*.bak
+/*.png

@@ -7,16 +7,15 @@ import requests
 import config
 import time
 
-server_params = StdioServerParameters(
-    command=config.MCP_COMMAND,
-    args=[
-        "mcp",
-        "--connect", config.MCP_ADDRESS,
-        "--allow-path", config.MCP_ALLOWED_PATH
-    ]
-)
-
 async def main() :
+    server_params = StdioServerParameters(
+        command=config.MCP_COMMAND,
+        args=[
+            "mcp",
+            "--connect", config.MCP_ADDRESS,
+            "--allow-path", config.MCP_ALLOWED_PATH
+        ]
+    )
     async with stdio_client(server_params) as (read, write):
         print("Connexion stdio établie")
         async with ClientSession(read, write) as session:
@@ -71,7 +70,10 @@ async def main() :
             print(f"[DEBUG] Taille des schémas : {len(json.dumps(tool_definition))} caractères")
             request_id = 0
             while True:
-                user_request = input("What are we making ?")
+                try:
+                    user_request = await asyncio.to_thread(input, "What are we making ?")
+                except EOFError:
+                    break
                 
                 if user_request.strip().lower() == "exit":
                     break
@@ -82,7 +84,7 @@ async def main() :
                 })   
                 print("[DEBUG] Dernière demande :", messages[-1])
                 print("[DEBUG] Messages avant agent :", len(messages))
-                agent_status = await run_agent(
+                await run_agent(
                     session,
                     messages,
                     payload,
@@ -90,11 +92,6 @@ async def main() :
                     tool_history,
                     request_id
                 )
-                if agent_status == "completed":
-                    context_size = len(json.dumps(messages))
-
-                    if context_size > config.CONTEXT_COMPACTION_THRESHOLD:
-                        await compact_history(session, messages)
 
 def call_llm(payload):
     response = requests.post(
@@ -104,6 +101,11 @@ def call_llm(payload):
     )
     response.raise_for_status()
     return response.json()
+
+def tool_succeeded(result):
+    if isinstance(result, dict):
+        return result.get("status") != "error" and result.get("ok") is not False
+    return not result.is_error
 
 def prepare_observation(result, tool_name):
     if isinstance(result, dict):
@@ -125,29 +127,23 @@ def prepare_observation(result, tool_name):
             })
     raw_observation = observation
 
-    success = (
-        result.get("status") != "error"
-        if isinstance(result, dict)
-        else not result.is_error
-    )
-    if tool_name == "describe_command" and success:
-        command = json.loads(observation)
-
-        observation = json.dumps({
-            "id": command["id"],
-            "input": command["input"],
-            "params": command["params"]
-        })
-    if tool_name == "list_commands" and success:
-        commands = json.loads(observation)
-
-        observation = json.dumps([
-            {
-                "id": command["id"],
-                "enabled": command["enabled"]
-            }
-            for command in commands
-        ])
+    if tool_succeeded(result) and tool_name in ("describe_command", "list_commands"):
+        try:
+            data = json.loads(observation)
+            if tool_name == "describe_command" and isinstance(data, dict):
+                observation = json.dumps({
+                    "id": data["id"],
+                    "input": data["input"],
+                    "params": data["params"]
+                })
+            elif tool_name == "list_commands" and isinstance(data, list):
+                observation = json.dumps([
+                    {"id": command["id"], "enabled": command["enabled"]}
+                    for command in data
+                ])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # Une optimisation de taille ne doit pas empêcher de lire le résultat.
+            observation = raw_observation
     return raw_observation, observation
 
 async def execute_tool(session, tool_name, arguments, allowed_tools):
@@ -158,14 +154,20 @@ async def execute_tool(session, tool_name, arguments, allowed_tools):
                 "status": "error",
                 "message": "Les arguments doivent être un objet JSON"
             }
-    except (json.JSONDecodeError,TypeError) :
+    except (json.JSONDecodeError,TypeError) as exc:
         result = {
             "status":"error",
-            "message":"argument issue: "+arguments
+            "message":f"Arguments JSON invalides : {exc}"
         }
     else :
         if tool_name == "execute":
             command = py_arguments.get("command")
+
+            if not isinstance(command, str):
+                return {
+                    "status": "error",
+                    "message": "Identifiant de commande invalide"
+                }
 
             if command in config.BLOCKED_COMMANDS:
                 return {
@@ -224,87 +226,12 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
     iteration = 0
     agent_status = "running"
     while iteration < config.MAX_ITERATIONS :
-        last_user_index = max(
-            index
-            for index, message in enumerate(messages)
-            if message["role"] == "user"
-        )
-
-        tool_cycles = [
-            index
-            for index in range(last_user_index + 1, len(messages))
-            if messages[index]["role"] == "assistant"
-            and messages[index].get("tool_calls")
-        ]
-        if len(tool_cycles) > 3:
-            start_recent = tool_cycles[-3]
-            print("[CONTEXT] Début des cycles récents :", start_recent)
-        cycle_ids = sorted({
-            entry["cycle_id"]
-            for entry in tool_history
-            if entry["request_id"] == request_id
-        })
-
-        recent_cycle_ids = set(cycle_ids[-3:])
-
-        old_history = [
-            entry
-            for entry in tool_history
-            if entry["request_id"] == request_id
-            and entry["cycle_id"] not in recent_cycle_ids
-        ]
-
-        operations = summarize_tool_history(old_history)
-        user_messages = [
-            message
-            for message in messages
-            if message["role"] == "user"
-        ]
-
-        current_goal = user_messages[-1] if user_messages else None
-        if len(tool_cycles) > 3 and current_goal:
-            cad_state = await get_cad_state(session)
-            compact_state = compact_cad_state(cad_state)
-
-            checkpoint_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        config.SYSTEM_PROMPT
-                        + "\n\nÉtat CAD actuel :\n"
-                        + json.dumps(compact_state, ensure_ascii=False)
-                        + "\n\nOpérations précédentes réussies :\n"
-                        + json.dumps(operations, ensure_ascii=False)
-                    )
-                },
-                current_goal,
-                *messages[start_recent:]
-            ]
-
-            print(
-                "[CHECKPOINT]",
-                len(messages),
-                "→",
-                len(checkpoint_messages),
-                "messages"
-            )
-            original_size = len(json.dumps(messages))
-            checkpoint_size = len(json.dumps(checkpoint_messages))
-
-            print(
-                f"[CHECKPOINT] Taille : {original_size} → {checkpoint_size} caractères"
-            )
-            if (
-                len(json.dumps(payload)) > config.CONTEXT_COMPACTION_THRESHOLD
-                and checkpoint_size <= original_size * 0.70
-            ):
-                messages[:] = checkpoint_messages
-
-                print(
-                    f"[CHECKPOINT] ACTIVÉ : "
-                    f"{original_size} → {checkpoint_size} caractères"
-                )
-        print("[CONTEXT] Cycles d'outils :", tool_cycles)
+        if payload_size(payload, messages) > config.CONTEXT_COMPACTION_THRESHOLD:
+            await compact_history(session, messages, payload, tool_history, request_id)
+            if payload_size(payload, messages) > config.CONTEXT_COMPACTION_THRESHOLD:
+                print("[CONTEXT] Contexte encore trop volumineux après compaction ; appel LLM annulé.")
+                agent_status = "context_limit"
+                break
         try:
             print(f"[DEBUG] Messages : {len(messages)}")
             print(f"[DEBUG] Payload : {len(json.dumps(payload))} caractères")
@@ -325,7 +252,7 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
             ]
 
             print("[CONTEXT] Frontières possibles :", boundaries)
-            data = call_llm(payload)
+            data = await asyncio.to_thread(call_llm, payload)
         except requests.exceptions.ConnectionError:
                 print ("Impossible de contacter Qwen")
                 agent_status = "failed"
@@ -371,11 +298,7 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
                 raw_observation, observation = prepare_observation(result, tool_name)
                 raw_size = len(raw_observation)
 
-                if isinstance(result, dict):
-                    success = result.get("status") != "error"
-                    
-                else:
-                    success = not result.is_error
+                success = tool_succeeded(result)
 
                 print(f"[MCP] {tool_name} → {'succès' if success else 'erreur'}")
                 if not success:
@@ -391,6 +314,8 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
                     "arguments": arguments,
                     "result": raw_observation,
                     "request_id": request_id,
+                    "tool_call_id": tool_call["id"],
+                    "success": success,
                 })
                 messages.append(tool_message)
                 print(f"[CONTEXT] Brut : {raw_size} → Envoyé : {len(observation)} caractères")
@@ -416,7 +341,13 @@ async def get_cad_state(session):
         }
     )
 
-    return json.loads(result.content[0].text)
+    if not tool_succeeded(result):
+        raise ValueError("Impossible de lire l'état CAD")
+    raw_observation, _ = prepare_observation(result, "inspect_design")
+    state = json.loads(raw_observation)
+    if not isinstance(state, dict):
+        raise ValueError("L'état CAD doit être un objet JSON")
+    return state
 
 def compact_cad_state(cad_state):
     
@@ -447,73 +378,134 @@ def compact_cad_state(cad_state):
     }
 
 
-async def compact_history(session, messages):
-    cad_state = await get_cad_state(session)
-    compact_state = compact_cad_state(cad_state)
-    system_message = {
-        "role": "system",
-        "content": (
-            config.SYSTEM_PROMPT
-            + "\n\nÉtat actuel du modèle SolidCraft :\n"
-            + json.dumps(compact_state, ensure_ascii=False)
-        )
-    }
+def payload_size(payload, messages):
+    return len(json.dumps({**payload, "messages": messages}))
 
-    user_indices = [
-        index
-        for index, message in enumerate(messages)
-        if message["role"] == "user"
-    ]
+
+def trim_tool_observations(messages, max_chars, tool_history):
+    statuses = {
+        entry["tool_call_id"]: entry.get("success")
+        for entry in tool_history
+        if "tool_call_id" in entry
+    }
+    trimmed = []
+    for message in messages:
+        content = message.get("content")
+        if message["role"] == "tool" and isinstance(content, str) and len(content) > max_chars:
+            success = statuses.get(message.get("tool_call_id"))
+            status = "success" if success is True else "error" if success is False else "unknown"
+            message = {
+                **message,
+                "content": json.dumps({
+                    "status": status,
+                    "truncated": True,
+                    "original_chars": len(content),
+                    "preview": content[:max_chars],
+                }, ensure_ascii=False)
+            }
+        trimmed.append(message)
+    return trimmed
+
+
+async def compact_history(session, messages, payload, tool_history, request_id):
+    original_size = payload_size(payload, messages)
+    candidates = []
+    user_indices = [index for index, message in enumerate(messages) if message["role"] == "user"]
 
     if user_indices:
-        start = user_indices[-1]
-        recent_messages = messages[start:]
-    else:
-        recent_messages = []
+        last_user_index = user_indices[-1]
+        tool_cycles = [
+            index
+            for index in range(last_user_index + 1, len(messages))
+            if messages[index]["role"] == "assistant" and messages[index].get("tool_calls")
+        ]
+        try:
+            cad_state = compact_cad_state(await get_cad_state(session))
+        except (MCPError, ValueError, TypeError, KeyError, IndexError, OSError) as exc:
+            # Sans état CAD fiable, garder les échanges et seulement réduire les observations.
+            print(f"[COMPACTION] État CAD indisponible : {exc}")
+        else:
+            operations = summarize_tool_history([
+                entry for entry in tool_history if entry["request_id"] == request_id
+            ])
+            system_message = {
+                "role": "system",
+                "content": (
+                    config.SYSTEM_PROMPT
+                    + "\n\nÉtat CAD actuel :\n"
+                    + json.dumps(cad_state, ensure_ascii=False)
+                    + "\n\nOpérations précédentes réussies :\n"
+                    + json.dumps(operations, ensure_ascii=False)
+                )
+            }
+            # Ne jamais séparer un appel d'outil de ses réponses, ni supprimer le dernier cycle.
+            keep_counts = range(min(3, len(tool_cycles)), 0, -1) if tool_cycles else [0]
+            for keep in keep_counts:
+                start = tool_cycles[-keep] if keep else last_user_index + 1
+                candidates.append([system_message, messages[last_user_index], *messages[start:]])
 
-    compact_messages = [
-        system_message,
-        *recent_messages
-    ]
-    print(f"[COMPACTION] {len(messages)} → {len(compact_messages)} messages")
-    print("[COMPACTION] État CAD :", len(json.dumps(compact_state)), "caractères")
-    print(json.dumps(compact_state, indent=2, ensure_ascii=False))
-    original_size = len(json.dumps(messages))
-    compact_size = len(json.dumps(compact_messages))
+    candidates.append(list(messages))
+    best_messages = messages
+    best_size = original_size
+    for candidate in candidates:
+        for limit in (None, 4000, 1000, 256):
+            compacted = (
+                candidate if limit is None
+                else trim_tool_observations(candidate, limit, tool_history)
+            )
+            size = payload_size(payload, compacted)
+            if size < best_size:
+                best_messages, best_size = compacted, size
+            if best_size <= config.CONTEXT_COMPACTION_THRESHOLD:
+                break
+        if best_size <= config.CONTEXT_COMPACTION_THRESHOLD:
+            break
 
-    print(f"[COMPACTION] Taille : {original_size} → {compact_size} caractères")
-    if compact_size < original_size:
-        messages[:] = compact_messages
+    if best_size < original_size:
+        print(f"[COMPACTION] Payload : {original_size} → {best_size} caractères")
+        messages[:] = best_messages
+        return True
+    return False
+
 
 def summarize_tool_history(tool_history):
     operations = []
-
     for entry in tool_history:
-        if entry["tool"] in ("execute", "batch", "set_parameter"):
-            arguments = json.loads(entry["arguments"])
-            try:
-                result = json.loads(entry["result"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(result, dict):
-                continue
-            if result.get("status") == "error":
-                continue
+        if entry.get("success") is not True:
+            continue
+        tool = entry.get("tool")
+        if tool not in ("execute", "batch", "set_parameter"):
+            continue
+        try:
+            arguments = json.loads(entry.get("arguments"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(arguments, dict):
+            continue
+        try:
+            result = json.loads(entry.get("result"))
+        except (json.JSONDecodeError, TypeError):
+            result = None
+        if isinstance(result, dict) and (result.get("status") == "error" or result.get("ok") is False):
+            continue
 
-            if result.get("ok") is False:
-                continue
-            if entry["tool"] == "execute":
-                operations.append(arguments["command"])
-
-            elif entry["tool"] == "batch":
-                for command in arguments["commands"]:
-                    operations.append(command["command"])
-
-            elif entry["tool"] == "set_parameter":
-                operations.append("set_parameter")
-
+        if tool == "execute":
+            command = arguments.get("command")
+            if isinstance(command, str):
+                operations.append(command)
+        elif tool == "batch":
+            commands = arguments.get("commands")
+            if isinstance(commands, list) and all(
+                isinstance(command, dict) and isinstance(command.get("command"), str)
+                for command in commands
+            ):
+                operations.extend(command["command"] for command in commands)
+        elif tool == "set_parameter":
+            operations.append("set_parameter")
     return operations
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 

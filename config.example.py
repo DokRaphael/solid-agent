@@ -13,6 +13,8 @@ MCP_ADDRESS = "127.0.0.1:7878"
 MCP_ALLOWED_PATH = "/path/to/your/cad-project"
 
 # Compaction
+# Serialized payload size in characters, including tool schemas. Oversized requests
+# are compacted before each LLM call; if they still exceed this budget, they stop.
 CONTEXT_COMPACTION_THRESHOLD = 50000
 
 #RESTRICT

@@ -7,11 +7,9 @@ I built this project **from scratch** to understand how an agent works and inter
 ## Demo
 https://github.com/user-attachments/assets/5ee426fb-93e3-4507-aab7-c3a92fdd82e9
 
+![Low-poly car built by Solid Agent](docs/images/low-poly-car.png)
 
-
-## How it works
-
-Given a natural-language request, the model selects which tools to call. The agent executes those calls through MCP and returns the results to the model, which can continue taking actions or provide an answer. Conversation history is kept throughout the session, with an iteration limit for each request.
+*1 shot prompt : build a low poly car*
 
 ## Getting started
 
@@ -29,4 +27,4 @@ Solidcraft --control 7878 &
 python solid-agent.py
 ```
 
-Enter a request in the terminal, or type `exit` to quit. Your `config.py` stays local and is ignored by Git.
+Enter a request in the terminal, or type `exit` to quit.
