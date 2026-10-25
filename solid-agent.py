@@ -17,10 +17,10 @@ async def main() :
         ]
     )
     async with stdio_client(server_params) as (read, write):
-        print("Connexion stdio établie")
+        print("Stdio connection established")
         async with ClientSession(read, write) as session:
             await session.initialize()
-            print("Session MCP initialisée")
+            print("MCP session initialized")
             cad_state = await get_cad_state(session)
             compact_state = compact_cad_state(cad_state)
             if cad_state.get("bodies"):
@@ -29,11 +29,11 @@ async def main() :
             if cad_state.get("params"):
                 print("[CAD] Parameter keys:", cad_state["params"][0].keys())
 
-            print("[CAD] État complet :", len(json.dumps(cad_state)), "caractères")
-            print("[CAD] État compact :", len(json.dumps(compact_state)), "caractères")
-            print("[CAD STATE] Nom :", cad_state.get("name"))
-            print("[CAD STATE] Corps :", len(cad_state.get("bodies", [])))
-            print("[CAD STATE] Paramètres :", len(cad_state.get("params", [])))
+            print("[CAD] Full state:", len(json.dumps(cad_state)), "characters")
+            print("[CAD] Compact state:", len(json.dumps(compact_state)), "characters")
+            print("[CAD STATE] Name:", cad_state.get("name"))
+            print("[CAD STATE] Bodies:", len(cad_state.get("bodies", [])))
+            print("[CAD STATE] Parameters:", len(cad_state.get("params", [])))
             result = await session.list_tools()
 
             available_tools = [
@@ -66,12 +66,12 @@ async def main() :
                 "tools":tool_definition,
                 "tool_choice": "auto"
             }
-            print(f"[DEBUG] Outils MCP : {len(tool_definition)}")
-            print(f"[DEBUG] Taille des schémas : {len(json.dumps(tool_definition))} caractères")
+            print(f"[DEBUG] MCP tools: {len(tool_definition)}")
+            print(f"[DEBUG] Schema size: {len(json.dumps(tool_definition))} characters")
             request_id = 0
             while True:
                 try:
-                    user_request = await asyncio.to_thread(input, "What are we making ?")
+                    user_request = await asyncio.to_thread(input, "What are we making? ")
                 except EOFError:
                     break
                 
@@ -82,8 +82,8 @@ async def main() :
                     "role":"user",
                     "content":user_request
                 })   
-                print("[DEBUG] Dernière demande :", messages[-1])
-                print("[DEBUG] Messages avant agent :", len(messages))
+                print("[DEBUG] Latest request:", messages[-1])
+                print("[DEBUG] Messages before agent run:", len(messages))
                 await run_agent(
                     session,
                     messages,
@@ -122,7 +122,7 @@ def prepare_observation(result, tool_name):
         else:
             observation = json.dumps({
                 "status": "error" if result.is_error else "success",
-                "message": "Résultat MCP non textuel",
+                "message": "Non-text MCP result",
                 "content_types": [item.type for item in result.content]
             })
     raw_observation = observation
@@ -142,7 +142,7 @@ def prepare_observation(result, tool_name):
                     for command in data
                 ])
         except (json.JSONDecodeError, KeyError, TypeError):
-            # Une optimisation de taille ne doit pas empêcher de lire le résultat.
+            # Keep the original result if size reduction fails.
             observation = raw_observation
     return raw_observation, observation
 
@@ -152,12 +152,12 @@ async def execute_tool(session, tool_name, arguments, allowed_tools):
         if not isinstance(py_arguments, dict):
             return {
                 "status": "error",
-                "message": "Les arguments doivent être un objet JSON"
+                "message": "Arguments must be a JSON object"
             }
     except (json.JSONDecodeError,TypeError) as exc:
         result = {
             "status":"error",
-            "message":f"Arguments JSON invalides : {exc}"
+            "message":f"Invalid JSON arguments: {exc}"
         }
     else :
         if tool_name == "execute":
@@ -166,13 +166,13 @@ async def execute_tool(session, tool_name, arguments, allowed_tools):
             if not isinstance(command, str):
                 return {
                     "status": "error",
-                    "message": "Identifiant de commande invalide"
+                    "message": "Invalid command ID"
                 }
 
             if command in config.BLOCKED_COMMANDS:
                 return {
                     "status": "error",
-                    "message": f"Commande interdite : {command}"
+                    "message": f"Blocked command: {command}"
                 }
         if tool_name == "batch":
             commands = py_arguments.get("commands")
@@ -180,14 +180,14 @@ async def execute_tool(session, tool_name, arguments, allowed_tools):
             if not isinstance(commands, list):
                 return {
                     "status": "error",
-                    "message": "batch.commands doit être une liste"
+                    "message": "batch.commands must be a list"
                 }
 
             for item in commands:
                 if not isinstance(item, dict):
                     return {
                         "status": "error",
-                        "message": "Commande batch invalide"
+                        "message": "Invalid batch command"
                     }
 
                 command = item.get("command")
@@ -195,13 +195,13 @@ async def execute_tool(session, tool_name, arguments, allowed_tools):
                 if not isinstance(command, str):
                     return {
                         "status": "error",
-                        "message": "Identifiant de commande invalide"
+                        "message": "Invalid command ID"
                     }
 
                 if command in config.BLOCKED_COMMANDS:
                     return {
                         "status": "error",
-                        "message": f"Commande interdite : {command}"
+                        "message": f"Blocked command: {command}"
                     }
         if tool_name in allowed_tools:
             try:
@@ -218,7 +218,7 @@ async def execute_tool(session, tool_name, arguments, allowed_tools):
         else :
             result = {
                 "status": "error",
-                "message": "Outil inconnu : "+tool_name
+                "message": "Unknown tool: "+tool_name
             }
     return result
 
@@ -229,12 +229,12 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
         if payload_size(payload, messages) > config.CONTEXT_COMPACTION_THRESHOLD:
             await compact_history(session, messages, payload, tool_history, request_id)
             if payload_size(payload, messages) > config.CONTEXT_COMPACTION_THRESHOLD:
-                print("[CONTEXT] Contexte encore trop volumineux après compaction ; appel LLM annulé.")
+                print("[CONTEXT] Context still exceeds the budget after compaction; LLM call cancelled.")
                 agent_status = "context_limit"
                 break
         try:
-            print(f"[DEBUG] Messages : {len(messages)}")
-            print(f"[DEBUG] Payload : {len(json.dumps(payload))} caractères")
+            print(f"[DEBUG] Messages: {len(messages)}")
+            print(f"[DEBUG] Payload: {len(json.dumps(payload))} characters")
             start = time.perf_counter()
             tool_chars = sum(
                 len(message["content"])
@@ -242,7 +242,7 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
                 if message["role"] == "tool"
             )
 
-            print(f"[CONTEXT] Historique outils : {tool_chars} caractères")
+            print(f"[CONTEXT] Tool history: {tool_chars} characters")
             boundaries = [
                 index
                 for index, message in enumerate(messages)
@@ -251,10 +251,10 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
                 and message.get("content")
             ]
 
-            print("[CONTEXT] Frontières possibles :", boundaries)
+            print("[CONTEXT] Compaction boundaries:", boundaries)
             data = await asyncio.to_thread(call_llm, payload)
         except requests.exceptions.ConnectionError:
-                print ("Impossible de contacter Qwen")
+                print ("Unable to reach the LLM API")
                 agent_status = "failed"
                 break
         except requests.exceptions.HTTPError as exc:
@@ -263,12 +263,12 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
             agent_status = "failed"
             break
         except requests.exceptions.Timeout:
-            print ("timeout")
-            print(f"[DEBUG] Timeout après {time.perf_counter() - start:.1f} s")
+            print ("LLM request timed out")
+            print(f"[DEBUG] Timeout after {time.perf_counter() - start:.1f} s")
             agent_status = "failed"
             break
         else:
-            print(f"[DEBUG] Réponse reçue en {time.perf_counter() - start:.1f} s")
+            print(f"[DEBUG] Response received in {time.perf_counter() - start:.1f} s")
             iteration+=1
             
             print("[DEBUG] finish_reason:", data["choices"][0]["finish_reason"])
@@ -281,14 +281,14 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
                 messages.append(assistant_message)
                 break
             else:
-                print("Qwen more outils")
+                print("[LLM] Tool calls requested")
             messages.append(assistant_message)
             cycle_id = iteration
             for tool_call in toolcalls :
                 
                 tool_name = tool_call["function"]["name"]
                 arguments = tool_call["function"]["arguments"]
-                print(f"[Qwen] {tool_name} → {arguments}")
+                print(f"[LLM] {tool_name} → {arguments}")
                 result = await execute_tool(
                     session,
                     tool_name,
@@ -300,7 +300,7 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
 
                 success = tool_succeeded(result)
 
-                print(f"[MCP] {tool_name} → {'succès' if success else 'erreur'}")
+                print(f"[MCP] {tool_name} → {'success' if success else 'error'}")
                 if not success:
                     print(f"[MCP ERROR] {observation[:1000]}")
                 tool_message = {
@@ -318,17 +318,17 @@ async def run_agent(session, messages, payload, allowed_tools, tool_history, req
                     "success": success,
                 })
                 messages.append(tool_message)
-                print(f"[CONTEXT] Brut : {raw_size} → Envoyé : {len(observation)} caractères")
-                print(f"[DEBUG] Observation : {len(observation)} caractères")
+                print(f"[CONTEXT] Raw: {raw_size} → Sent: {len(observation)} characters")
+                print(f"[DEBUG] Observation: {len(observation)} characters")
     if agent_status == "running":
         agent_status = "max_iterations"
 
-    print("[HISTORY] Cycles :", [
+    print("[HISTORY] Cycles:", [
         (entry["request_id"], entry["cycle_id"], entry["tool"])
         for entry in tool_history
     ])
     operations = summarize_tool_history(tool_history)
-    print("[HISTORY] Opérations :", operations)
+    print("[HISTORY] Operations:", operations)
     print("Agent status:", agent_status)
     return agent_status
 
@@ -342,11 +342,11 @@ async def get_cad_state(session):
     )
 
     if not tool_succeeded(result):
-        raise ValueError("Impossible de lire l'état CAD")
+        raise ValueError("Unable to read the CAD state")
     raw_observation, _ = prepare_observation(result, "inspect_design")
     state = json.loads(raw_observation)
     if not isinstance(state, dict):
-        raise ValueError("L'état CAD doit être un objet JSON")
+        raise ValueError("CAD state must be a JSON object")
     return state
 
 def compact_cad_state(cad_state):
@@ -422,8 +422,8 @@ async def compact_history(session, messages, payload, tool_history, request_id):
         try:
             cad_state = compact_cad_state(await get_cad_state(session))
         except (MCPError, ValueError, TypeError, KeyError, IndexError, OSError) as exc:
-            # Sans état CAD fiable, garder les échanges et seulement réduire les observations.
-            print(f"[COMPACTION] État CAD indisponible : {exc}")
+            # Without reliable CAD state, retain the conversation and only trim observations.
+            print(f"[COMPACTION] CAD state unavailable: {exc}")
         else:
             operations = summarize_tool_history([
                 entry for entry in tool_history if entry["request_id"] == request_id
@@ -432,13 +432,13 @@ async def compact_history(session, messages, payload, tool_history, request_id):
                 "role": "system",
                 "content": (
                     config.SYSTEM_PROMPT
-                    + "\n\nÉtat CAD actuel :\n"
+                    + "\n\nCurrent CAD state:\n"
                     + json.dumps(cad_state, ensure_ascii=False)
-                    + "\n\nOpérations précédentes réussies :\n"
+                    + "\n\nPreviously successful operations:\n"
                     + json.dumps(operations, ensure_ascii=False)
                 )
             }
-            # Ne jamais séparer un appel d'outil de ses réponses, ni supprimer le dernier cycle.
+            # Keep tool calls together with their results and retain the latest cycle.
             keep_counts = range(min(3, len(tool_cycles)), 0, -1) if tool_cycles else [0]
             for keep in keep_counts:
                 start = tool_cycles[-keep] if keep else last_user_index + 1
@@ -462,7 +462,7 @@ async def compact_history(session, messages, payload, tool_history, request_id):
             break
 
     if best_size < original_size:
-        print(f"[COMPACTION] Payload : {original_size} → {best_size} caractères")
+        print(f"[COMPACTION] Payload: {original_size} → {best_size} characters")
         messages[:] = best_messages
         return True
     return False
